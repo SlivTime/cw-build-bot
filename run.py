@@ -60,7 +60,8 @@ class Matcher:
         return msg.startswith("Ты заметил")
 
     def is_construction_report(self, msg):
-        return 'Подробнее:' in msg
+        trigger = 'Подробнее:'
+        return msg.count(trigger) > 1
 
     def is_fight_message(self, msg):
         return '/fight' in msg
@@ -118,7 +119,7 @@ class ConstructionState:
     def update_from_message(self, msg):
         state_dict = self._parse(msg)
         self._state.update(state_dict)
-        
+        logger.info('Current state: %s', self._state)
 
     def get_current_target(self):
         for target in self.repair_priority:
@@ -247,9 +248,7 @@ class ChatController:
                 self._client.forward_messages(self.tcb, [event.message])
 
                 self._state.update(self._client)
-                self.go_build()
-
-                self._update_try(5 * 60)
+                self._update_try(10)
                 logger.info("Я построиль")
 
             elif m.cannot_build_now(msg):
