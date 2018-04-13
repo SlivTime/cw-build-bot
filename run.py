@@ -60,7 +60,7 @@ class Matcher:
         return msg.startswith("Ты заметил")
 
     def is_construction_report(self, msg):
-        return msg.strip().startswith('Ратуша')
+        return 'Подробнее:' in msg
 
     def is_fight_message(self, msg):
         return '/fight' in msg
@@ -85,7 +85,7 @@ class ConstructionState:
             for target in self.repair_priority
         }
         self._state = initial_state
-        self._last_updated = datetime.fromtimestamp(0)
+        self._last_updated = datetime.utcfromtimestamp(0)
 
     @property
     def state(self):
@@ -106,7 +106,7 @@ class ConstructionState:
             if '/to' in id_line:
                 id_ = id_line.split('_')[-1]
 
-            state_dict[id_] = state
+            state_dict[id_] = int(state)
         return state_dict
 
     def update(self, client):
@@ -118,6 +118,7 @@ class ConstructionState:
     def update_from_message(self, msg):
         state_dict = self._parse(msg)
         self._state.update(state_dict)
+        
 
     def get_current_target(self):
         for target in self.repair_priority:
