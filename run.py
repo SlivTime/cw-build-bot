@@ -2,6 +2,9 @@ import sys
 import logging
 from datetime import datetime
 from datetime import timedelta
+from datetime import time
+from time import sleep
+import random
 import telethon
 from telethon import events
 
@@ -31,6 +34,13 @@ API_HASH = ''
 def bootstrap():
     with open('config.py', 'w') as f:
         f.write(CFG_EXAMPLE)
+
+
+def from_cw_bot(method):
+    def wrap(self, event):
+        if self._is_cw_bot(event):
+            return method(self, event)
+    return wrap
 
 
 class Matcher:
@@ -66,9 +76,142 @@ class Matcher:
     def is_fight_message(self, msg):
         return '/fight' in msg
 
+    def is_buisy(self, msg):
+        return 'Ты отправился искать приключения' in msg
 
-class ConstructionState:
+    def is_stats(self, msg):
+        return 'Подробнее: /hero' in msg
+
+    def is_arena_message(self, msg):
+        return 'выбери точку атаки и точку защиты' in msg
+
+    def is_arena_state(self, msg):
+        return 'Добро пожаловать на арену!' in msg
+
+
+class State:
     cw_id = 265204902
+    update_interval = timedelta(minutes=3)
+    _last_updated = datetime.utcfromtimestamp(0)
+    _state = {}
+    get_state_msg = ''
+
+    def _parse(self, msg):
+        raise NotImplementedError
+
+    def get_current_target(self):
+        raise NotImplementedError
+
+    def update(self, client):
+        now = datetime.now()
+        if now > self._last_updated + self.update_interval:
+            cw = client.get_entity(self.cw_id)
+            client.send_message(cw, self.get_state_msg)
+
+    def update_from_message(self, msg):
+        state_dict = self._parse(msg)
+        self._state.update(state_dict)
+        logger.info('Current state: %s', self._state)
+
+
+def is_night(dt):
+    night_hour_periods = (
+        (0, 2),
+        (8, 10),
+        (16, 18),
+    )
+    current_hour = dt.hour
+    for begin, end in night_hour_periods:
+        if current_hour in range(begin, end):
+            return True
+    return False
+
+
+class HeroState(State):
+    get_state_msg = '🏅Герой'
+
+    def __init__(self):
+        self._state = {
+            'stamina': 0,
+            'gold': 0,
+        }
+
+    @property
+    def stamina(self):
+        return self._state.get('stamina')
+
+    def _parse(self, msg):
+        gold_marker = '💰'
+        stamina_marker = '🔋Выносливость:'
+
+        state_dict = {}
+
+        for line in msg.split('\n'):
+            if stamina_marker in line:
+                _, amount, _ = line.split(' ')
+                current, total = amount.strip().split('/')
+                state_dict['stamina'] = int(current)
+
+            if gold_marker in line:
+                gold, _ = line.split(' ')
+                gold = gold.replace(gold_marker, '')
+                state_dict['gold'] = int(gold)
+
+        return state_dict
+
+    def get_current_target(self):
+        now = datetime.now()
+        if is_night(now):
+            return None
+        return '🌲Лес' if self.stamina > 0 else None
+
+
+class ArenaState(State):
+    get_state_msg = '📯Арена'
+
+    def __init__(self):
+        self._state = {
+            'current': 0,
+            'total': 0,
+        }
+
+    @property
+    def can_fight(self):
+        return self._state['current'] < self._state['total']
+
+    def _parse(self, msg):
+        marker = '⌛Поединков сегодня'
+        state_dict = {}
+        for line in msg.split('\n'):
+            if marker in line:
+                state_line = line.replace(marker, '').replace('**', '').strip()
+                current, total = state_line.split(' из ')
+                state_dict['current'] = int(current)
+                state_dict['total'] = int(total)
+        return state_dict
+
+    def get_current_target(self):
+        return '🔎Поиск соперника' if self.can_fight else None
+
+    def get_attack_target(self):
+        choices = [
+            '🗡в голову',
+            '🗡по корпусу',
+            '🗡по ногам',
+        ]
+        return random.choice(choices)
+
+    def get_defence_target(self):
+        choices = [
+            '🛡головы',
+            '🛡корпуса',
+            '🛡ног',
+        ]
+        return random.choice(choices)
+
+
+class ConstructionState(State):
+
     get_state_msg = '🏘Постройки'
     repair_priority = [
         'wall',
@@ -78,7 +221,6 @@ class ConstructionState:
         'hq',
         'monument',
     ]
-    update_interval = timedelta(minutes=3)
 
     def __init__(self):
         initial_state = {
@@ -110,17 +252,6 @@ class ConstructionState:
             state_dict[id_] = int(state)
         return state_dict
 
-    def update(self, client):
-        now = datetime.now()
-        if now > self._last_updated + self.update_interval:
-            cw = client.get_entity(self.cw_id)
-            client.send_message(cw, self.get_state_msg)
-
-    def update_from_message(self, msg):
-        state_dict = self._parse(msg)
-        self._state.update(state_dict)
-        logger.info('Current state: %s', self._state)
-
     def get_current_target(self):
         for target in self.repair_priority:
             current_state = self._state.get(target)
@@ -135,6 +266,11 @@ class ChatController:
     cw_id = 265204902  # Бот чв
     squad_id = 1225237775  # id чата, откуда брать пины для следования в чв
     flags_there_id = 1338302986  # Куда скидывать пины
+
+    sleep_time = (
+        time(hour=1),
+        time(hour=8),
+    )
 
     flags = (
         "🇻🇦",  # жз
@@ -153,14 +289,17 @@ class ChatController:
         self._client = client
         self._matcher = Matcher()
         self._state = ConstructionState()
+        self._hero_state = HeroState()
+        self._arena_state = ArenaState()
         self.son = client.get_entity(self.son_id)
         self.tcb = client.get_entity(self.tcb_id)
         self.cw = client.get_entity(self.cw_id)
         self.squad = client.get_entity(self.squad_id)
         self.flags_there = client.get_entity(self.flags_there_id)
 
-        self._last_try = None
-        self._retry_at = None
+        now = datetime.now()
+        self._last_try = now
+        self._retry_at = now
 
         self._init_callbacks()
 
@@ -173,6 +312,12 @@ class ChatController:
     @property
     def _can_retry(self):
         return datetime.now() > self._retry_at
+
+    @property
+    def _is_sleeping(self):
+        begin, end = self.sleep_time
+        now = datetime.now()
+        return begin < now.time() < end
 
     @property
     def message_handlers(self):
@@ -218,11 +363,7 @@ class ChatController:
                     # Сливаем пин (если только это не академка)
 
     def _is_cw_bot(self, event):
-        return all([
-            event.is_private,
-            event.chat.bot,
-            event.chat.id == self.cw_id,
-        ])
+        return event.chat.id == self.cw_id
 
     def is_squad_chat(self, event):
         return event.chat.id == self.squad_id
@@ -233,10 +374,28 @@ class ChatController:
             logging.info('Got message about construction state: %s', msg)
             self._state.update_from_message(msg)
 
+    @from_cw_bot
+    def _arena_state_handler(self, event):
+        msg = event.text
+        if self._matcher.is_arena_state(msg):
+            logging.info('Got message about construction state: %s', msg)
+            self._arena_state.update_from_message(msg)
+
+    def _is_buisy_handler(self, event):
+        msg = str(event.text)
+        if self._is_cw_bot and self._matcher.is_buisy(msg):
+            self.update_state()
+
     def _update_try(self, retry_after=30):
-        self._last_try = datetime.now()
+        now = datetime.now()
+        self._last_try = now
         if retry_after:
-            self._retry_at = self._last_try + timedelta(seconds=retry_after)
+            # max_timeout = 5 * 60
+            # new_retry_time = self._retry_at + timedelta(seconds=retry_after)
+            # diff = now - new_retry_time
+            # new_timeout = min(max_timeout, diff.seconds)
+            self._retry_at = now + timedelta(seconds=retry_after)
+            logger.info('Set new retry timer to %s', self._retry_at.time())
 
     def _private_message_handler(self, event):
         if self._is_cw_bot:
@@ -258,10 +417,31 @@ class ChatController:
                 client.send_message(self.cw, "/go")
 
     def _fight_handler(self, event):
-        if self.is_squad_chat(event) and \
-                self._matcher.is_fight_message(event.text):
-            logger.info('Got fight message: %s', event.text)
-            self._client.forward_messages(self.cw, [event.message])
+        if self._matcher.is_fight_message(event.text):
+            if self._is_cw_bot(event):
+                logger.info('Got fight message: %s', event.text)
+                self._client.forward_messages(self.cw, [event.message])
+            #     self._client.forward_messages(self.squad, [event.message])
+            else:
+                logger.info('Got fight message: %s', event.text)
+                self._client.forward_messages(self.cw, [event.message])
+
+    def _hero_handler(self, event):
+        if self._is_cw_bot(event) and self._matcher.is_stats(event.text):
+            logger.info('Got stats message: %s', event.text)
+            self._hero_state.update_from_message(event.text)
+
+    @from_cw_bot
+    def _arena_handler(self, event):
+        if self._matcher.is_arena_message(event.text):
+            logger.info('Got arena message: %s', event.text)
+            attack = self._arena_state.get_attack_target()
+            defence = self._arena_state.get_defence_target()
+
+            sleep(3)
+            client.send_message(self.cw, attack)
+            sleep(3)
+            client.send_message(self.cw, defence)
 
     def go_build(self):
         target = self._state.get_current_target()
@@ -290,15 +470,59 @@ class ChatController:
             self.flags_there_id,
         )
 
+    def _get_current_target(self):
+        if self._is_sleeping:
+            return None
+
+        hero_target = self._hero_state.get_current_target()
+        if hero_target is not None:
+            return hero_target
+
+        arena_target = self._arena_state.get_current_target()
+        if arena_target is not None:
+            return arena_target
+
+        build_target = self._state.get_current_target()
+        if build_target is not None:
+            return build_target
+
+    def do_action(self):
+        target = self._get_current_target()
+        if not self._can_retry:
+            diff = self._retry_at - datetime.now()
+            logger.warning(
+                'Cannot retry now. Will try in %s seconds.',
+                diff.seconds,
+            )
+            return
+        if target:
+            logger.info('Got target %s', target)
+            self._client.send_message(self.cw, target)
+            self._update_try(5 * 60)
+        else:
+            logger.warning(
+                'Could not get target. State: %s', self._state)
+
+    @property
+    def states(self):
+        return (
+            self._hero_state,
+            self._arena_state,
+            self._state,
+        )
+
+    def update_state(self):
+        for state in self.states:
+            state.update(self._client)
+            sleep(5)
+
     def run(self):
         logger.info('Started')
 
-        self._state.update(self._client)
-        self._update_try(5)
-
         while True:
             if self._can_retry:
-                self.go_build()
+                self.update_state()
+                self.do_action()
 
 
 if __name__ == '__main__':
