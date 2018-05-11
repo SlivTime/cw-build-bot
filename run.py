@@ -7,6 +7,7 @@ from time import sleep
 import random
 import telethon
 from telethon import events
+from telethon.tl.functions.messages import GetBotCallbackAnswerRequest
 
 
 logger = logging.getLogger()
@@ -88,10 +89,14 @@ class Matcher:
     def is_arena_state(self, msg):
         return 'Добро пожаловать на арену!' in msg
 
+    def is_market_message(self, msg):
+        marker = 'предлагает:'
+        return msg.count(marker) == 2
+
 
 class State:
     cw_id = 265204902
-    update_interval = timedelta(minutes=3)
+    update_interval = timedelta(minutes=10)
     _last_updated = datetime.utcfromtimestamp(0)
     _state = {}
     get_state_msg = ''
@@ -111,6 +116,7 @@ class State:
     def update_from_message(self, msg):
         state_dict = self._parse(msg)
         self._state.update(state_dict)
+        self._last_updated = datetime.now()
         logger.info('Current state: %s', self._state)
 
 
@@ -148,8 +154,8 @@ class HeroState(State):
 
         for line in msg.split('\n'):
             if stamina_marker in line:
-                _, amount, _ = line.split(' ')
-                current, total = amount.strip().split('/')
+                line = line.replace(stamina_marker, '').strip()
+                current, total = line.split('/')
                 state_dict['stamina'] = int(current)
 
             if gold_marker in line:
@@ -191,6 +197,19 @@ class ArenaState(State):
         return state_dict
 
     def get_current_target(self):
+        now = datetime.now()
+        good_times = (
+            (13, 15),
+            (21, 23),
+        )
+
+        now_is_good_time = any([
+            now.hour in range(begin, end)
+            for begin, end in good_times
+        ])
+        if not now_is_good_time:
+            return None
+
         return '🔎Поиск соперника' if self.can_fight else None
 
     def get_attack_target(self):
@@ -228,6 +247,7 @@ class ConstructionState(State):
             for target in self.repair_priority
         }
         self._state = initial_state
+        self._target = None
         self._last_updated = datetime.utcfromtimestamp(0)
 
     @property
@@ -257,6 +277,10 @@ class ConstructionState(State):
             current_state = self._state.get(target)
             if current_state < 100:
                 return f'/repair_{target}'
+        return self._target
+
+    def set_current_target(self, target):
+        self._target = target
 
 
 class ChatController:
@@ -398,9 +422,21 @@ class ChatController:
             logger.info('Set new retry timer to %s', self._retry_at.time())
 
     def _private_message_handler(self, event):
-        if self._is_cw_bot:
+        if self._is_cw_bot(event):
             msg = str(event.text)
             m = self._matcher
+
+            # if 'foo' in event.text:
+            #     buttons = event.message.reply_markup.rows[0].buttons
+            #     first_btn_data = buttons[0].data
+            #     self._client(
+            #         GetBotCallbackAnswerRequest(
+            #             event.chat.id,
+            #             event.message.id,
+            #             data=first_btn_data,
+            #         )
+            #     )
+            #     logger.info('Chose first button')
 
             if m.is_build_report(msg):
                 self._client.forward_messages(self.son, [event.message])
@@ -443,6 +479,10 @@ class ChatController:
             sleep(3)
             client.send_message(self.cw, defence)
 
+    # def _market_handler(self, event):
+    #     if self._matcher.is_market_message(event.text):
+    #         logger.info('got marget message: %s', event.text)
+
     def go_build(self):
         target = self._state.get_current_target()
         if not self._can_retry:
@@ -471,15 +511,12 @@ class ChatController:
         )
 
     def _get_current_target(self):
-        if self._is_sleeping:
-            return None
-
         hero_target = self._hero_state.get_current_target()
         if hero_target is not None:
             return hero_target
 
         arena_target = self._arena_state.get_current_target()
-        if arena_target is not None:
+        if arena_target is not None and not self._is_sleeping:
             return arena_target
 
         build_target = self._state.get_current_target()
