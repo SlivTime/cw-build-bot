@@ -95,7 +95,7 @@ class Matcher:
 
 
 class State:
-    cw_id = 265204902
+    cw_id = 587303845
     update_interval = timedelta(minutes=10)
     _last_updated = datetime.utcfromtimestamp(0)
     _state = {}
@@ -131,6 +131,14 @@ def is_night(dt):
         if current_hour in range(begin, end):
             return True
     return False
+
+
+def is_battle_soon(dt):
+    border_period = timedelta(minutes=10)
+    current_time = dt.time()
+    current_hour = current_time.hour
+    future_hour = (dt + border_period).hour
+    return future_hour != current_hour and future_hour % 4 == 0
 
 
 class HeroState(State):
@@ -287,7 +295,7 @@ class ChatController:
 
     son_id = 420406021  # Бот посылающий приказы, которым следовать
     tcb_id = 335184999  # Еще один бот для приказов, которым следовать
-    cw_id = 265204902  # Бот чв
+    cw_id = 587303845  # Бот чв
     squad_id = 1225237775  # id чата, откуда брать пины для следования в чв
     flags_there_id = 1338302986  # Куда скидывать пины
 
@@ -549,6 +557,11 @@ class ChatController:
         )
 
     def update_state(self):
+        now = datetime.now()
+        if is_battle_soon(now):
+            self._update_try(10 * 60)
+            return
+
         for state in self.states:
             state.update(self._client)
             sleep(5)
